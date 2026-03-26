@@ -190,7 +190,7 @@ Both algorithms are optimal up to small constant factors across all bit-widths.
 ## Dependencies(Optional)
 
 ```
-conda activate -n turboquant python=3.10 -
+conda activate -n turboquant python=3.10 -y
 
 pip install -r requirements.txt
 ```
