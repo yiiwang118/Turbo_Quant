@@ -1,0 +1,16 @@
+# LongBench evaluation config for TurboQuant repo
+# bits: [0] means baseline (no KV quantization)
+
+model: meta-llama/Meta-Llama-3.1-8B-Instruct
+tasks:
+  - narrativeqa
+  - qasper
+  - multifieldqa_en
+bits:
+  - 0
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+output: results/longbench_no_quant.json
+seed: 42
+

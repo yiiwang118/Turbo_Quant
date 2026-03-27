@@ -18,10 +18,17 @@ from codebook import compute_codebook
 # ---------------------------------------------------------------------------
 
 def random_rotation(d: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """Generate a random rotation matrix via QR decomposition."""
+    """Generate a Haar-distributed random orthogonal matrix via QR decomposition.
+
+    Plain QR gives a Q whose distribution is not uniform on O(d). The standard
+    fix is to multiply each column of Q by the sign of the corresponding diagonal
+    entry of R, which forces R to have positive diagonal and makes Q Haar-distributed.
+    """
     A = torch.randn(d, d, device=device, dtype=dtype)
-    Q, _ = torch.linalg.qr(A)
-    return Q  # (d, d) orthogonal matrix
+    Q, R = torch.linalg.qr(A)
+    signs = torch.diag(R).sign()
+    Q = Q * signs.unsqueeze(0)
+    return Q
 
 
 def load_or_compute_codebook(b: int, d: int) -> torch.Tensor:
@@ -30,7 +37,7 @@ def load_or_compute_codebook(b: int, d: int) -> torch.Tensor:
     path = os.path.join(os.path.dirname(__file__), "codebooks.npz")
     if os.path.exists(path):
         data = np.load(path)
-        key = f"b{b}"
+        key = f"b{b}_d{d}"
         if key in data:
             return torch.from_numpy(data[key].astype(np.float32))
     # Compute on the fly
@@ -267,6 +274,44 @@ class TurboQuantProd:
         x_hat = self.quant_dequant(x)
         return (y * x_hat).sum(dim=-1)
 
+    def asymmetric_inner_product(
+        self,
+        queries: torch.Tensor,
+        idx: Optional[torch.Tensor],
+        qjl: torch.Tensor,
+        gamma: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batched asymmetric inner product <queries, compressed_keys>.
+
+        Computes attention scores directly from the compressed key representation
+        without decompressing. Estimator (unbiased):
+
+            <q, k> ≈ <q, k_mse> + γ · √(π/2)/d · <S q, qjl_k>
+
+        Args:
+            queries : (..., S_q, d)
+            idx     : (..., S_k, d) int32 MSE indices, or None when b_mse=0
+            qjl     : (..., S_k, d) int8 QJL sign bits
+            gamma   : (..., S_k)    residual L2 norms
+
+        Returns:
+            scores  : (..., S_q, S_k)
+        """
+        # term1: <q, k_mse>  shape (..., S_q, S_k)
+        if self.mse is not None and idx is not None:
+            k_mse = self.mse.dequant(idx)                          # (..., S_k, d)
+            term1 = torch.matmul(queries, k_mse.transpose(-2, -1))
+        else:
+            term1 = queries.new_zeros(*queries.shape[:-2], queries.shape[-2], qjl.shape[-2])
+
+        # term2: γ · √(π/2)/d · <S q, qjl>  shape (..., S_q, S_k)
+        q_proj = torch.matmul(queries, self.S.T)                   # (..., S_q, d)
+        qjl_ip = torch.matmul(q_proj, qjl.to(queries.dtype).transpose(-2, -1))
+        scale = (np.pi / 2) ** 0.5 / self.d
+        term2 = scale * qjl_ip * gamma.unsqueeze(-2)               # (..., S_q, S_k)
+
+        return term1 + term2
+
 
 # ---------------------------------------------------------------------------
 # Utility: normalize vectors to unit sphere
@@ -276,3 +321,134 @@ def normalize(x: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.T
     """Normalize rows of x to unit norm. Returns (x_normalized, norms)."""
     norms = torch.linalg.norm(x, dim=-1, keepdim=True).clamp(min=eps)
     return x / norms, norms.squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# TurboQuantKVCache
+# ---------------------------------------------------------------------------
+
+class TurboQuantKVCache:
+    """KV cache backed by TurboQuant.
+
+    Keys   → TurboQuantProd  (unbiased inner product for attention scores)
+    Values → TurboQuantMSE   (MSE reconstruction for weighted sum)
+
+    Handles non-unit-norm inputs: normalises before quantisation and restores
+    the original scale during score computation / reconstruction.
+
+    Usage::
+
+        cache = TurboQuantKVCache(d_key=128, d_value=128, b_key=4, b_value=4)
+        cache.append(keys, values)          # (..., S, d) — arbitrary norm
+        scores = cache.attention_scores(q)  # (..., S_q, S_k) — no decompression
+        vals   = cache.get_values()         # (..., S_k, d_value)
+    """
+
+    def __init__(
+        self,
+        d_key: int,
+        d_value: int,
+        b_key: int = 4,
+        b_value: int = 4,
+        device: torch.device = torch.device("cpu"),
+        dtype: torch.dtype = torch.float32,
+        seed: int = 42,
+    ):
+        self.d_key   = d_key
+        self.d_value = d_value
+        self.device  = device
+        self.dtype   = dtype
+
+        self.key_q = TurboQuantProd(d_key,   b_key,   device=device, dtype=dtype, seed=seed)
+        self.val_q = TurboQuantMSE (d_value, b_value, device=device, dtype=dtype, seed=seed + 1)
+
+        self._key_cache: list = []   # dicts: {idx, qjl, gamma, norms}
+        self._val_cache: list = []   # dicts: {idx, norms}
+
+    def append(self, keys: torch.Tensor, values: torch.Tensor) -> None:
+        """Quantise and store new KV pairs.
+
+        Args:
+            keys   : (..., S, d_key)
+            values : (..., S, d_value)
+        """
+        # Keys — normalise to unit sphere first
+        k_norms = torch.linalg.norm(keys,   dim=-1, keepdim=True).clamp(min=1e-8)
+        idx, qjl, gamma = self.key_q.quant(keys / k_norms)
+        self._key_cache.append({
+            "idx": idx, "qjl": qjl, "gamma": gamma,
+            "norms": k_norms.squeeze(-1),
+        })
+
+        # Values — same normalise-before-quantise pattern
+        v_norms = torch.linalg.norm(values, dim=-1, keepdim=True).clamp(min=1e-8)
+        val_idx = self.val_q.quant(values / v_norms)
+        self._val_cache.append({
+            "idx": val_idx,
+            "norms": v_norms.squeeze(-1),
+        })
+
+    def attention_scores(self, queries: torch.Tensor) -> torch.Tensor:
+        """Compute <q, k> for all cached keys without decompressing K.
+
+        Args:
+            queries : (..., S_q, d_key)
+
+        Returns:
+            scores  : (..., S_q, S_k_total)
+        """
+        parts = []
+        for entry in self._key_cache:
+            # Scores against unit-norm keys: (..., S_q, S_k)
+            s = self.key_q.asymmetric_inner_product(
+                queries, entry["idx"], entry["qjl"], entry["gamma"]
+            )
+            # Restore original key scale: broadcast (..., 1, S_k)
+            s = s * entry["norms"].unsqueeze(-2)
+            parts.append(s)
+        return torch.cat(parts, dim=-1)
+
+    def get_values(self) -> torch.Tensor:
+        """Reconstruct all cached values.
+
+        Returns:
+            values : (..., S_k_total, d_value)
+        """
+        parts = []
+        for entry in self._val_cache:
+            v = self.val_q.dequant(entry["idx"])           # unit-norm reconstruction
+            v = v * entry["norms"].unsqueeze(-1)           # restore scale
+            parts.append(v)
+        return torch.cat(parts, dim=-2)
+
+    def memory_bits(self) -> dict:
+        """Estimate storage cost in bits."""
+        b_mse = self.key_q.b_mse
+        b_val = self.val_q.b
+
+        key_bits = val_bits = fp16_bits = 0
+        for e in self._key_cache:
+            n = e["gamma"].numel()          # number of key vectors
+            key_bits += e["idx"].numel() * b_mse if e["idx"] is not None else 0
+            key_bits += e["qjl"].numel()    # 1 bit each
+            key_bits += n * 16              # gamma  (fp16)
+            key_bits += n * 16              # norms  (fp16)
+            fp16_bits += n * self.d_key * 16
+
+        for e in self._val_cache:
+            n = e["norms"].numel()
+            val_bits  += e["idx"].numel() * b_val
+            val_bits  += n * 16             # norms  (fp16)
+            fp16_bits += n * self.d_value * 16
+
+        total = key_bits + val_bits
+        return {
+            "key_bits":          key_bits,
+            "val_bits":          val_bits,
+            "total_bits":        total,
+            "fp16_bits":         fp16_bits,
+            "compression_ratio": fp16_bits / total if total > 0 else 0.0,
+        }
+
+    def __len__(self) -> int:
+        return sum(e["gamma"].numel() for e in self._key_cache)

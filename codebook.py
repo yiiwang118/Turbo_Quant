@@ -14,23 +14,23 @@ from typing import Tuple
 def beta_pdf_normalized(x: np.ndarray, d: int) -> np.ndarray:
     """PDF of a single coordinate of a uniform random unit vector in R^d.
 
-    The coordinate follows Beta(1/2, (d-1)/2) scaled to [-1, 1],
-    i.e., if u ~ Uniform(S^{d-1}), then u_1 ~ Beta(1/2,(d-1)/2) on [-1,1].
-    For large d this converges to N(0, 1/d).
+    For u ~ Uniform(S^{d-1}), the marginal density of u_1 is
+        f(x) ∝ (1 - x^2)^{(d-3)/2}  on [-1, 1].
+    Via the substitution t = (x+1)/2 this equals Beta((d-1)/2, (d-1)/2) on [0,1].
+    For large d (>= 100) this converges to N(0, 1/d).
     """
     if d >= 100:
         # Gaussian approximation is accurate for d >= 100
         std = 1.0 / np.sqrt(d)
         return stats.norm.pdf(x, loc=0, scale=std)
     else:
-        # Use exact Beta(1/2, (d-1)/2) distribution scaled to [-1, 1]
-        # If u_1 ~ Beta(a, b) on [0,1], then t = 2*u_1 - 1 ~ scaled Beta on [-1,1]
-        # PDF: f(t) = f_beta((t+1)/2) / 2
-        a, b = 0.5, (d - 1) / 2.0
-        t = (x + 1) / 2.0  # map [-1,1] -> [0,1]
-        # clip to avoid boundary issues
-        t = np.clip(t, 1e-10, 1 - 1e-10)
-        return stats.beta.pdf(t, a, b) / 2.0
+        # Exact distribution: Beta((d-1)/2, (d-1)/2) mapped to [-1, 1]
+        a = (d - 1) / 2.0
+        b = (d - 1) / 2.0
+        t = (x + 1) / 2.0  # map [-1, 1] -> [0, 1]
+        in_support = (x >= -1) & (x <= 1)
+        t_safe = np.clip(t, 1e-10, 1 - 1e-10)
+        return np.where(in_support, stats.beta.pdf(t_safe, a, b) / 2.0, 0.0)
 
 
 def lloyd_max_iteration(
@@ -86,14 +86,18 @@ def compute_codebook(
         d: vector dimension (determines coordinate distribution)
         n_iter: maximum iterations
         tol: convergence tolerance
-        x_range: range [-x_range/sqrt(d), x_range/sqrt(d)] for integration
+        x_range: for d >= 100 (Gaussian), integration range is [-x_range/sqrt(d), x_range/sqrt(d)]
 
     Returns:
         centroids: sorted array of shape (k,)
     """
     std = 1.0 / np.sqrt(d)
-    x_min = -x_range * std
-    x_max = x_range * std
+    if d < 100:
+        # Exact Beta distribution has support [-1, 1]
+        x_min, x_max = -1.0, 1.0
+    else:
+        x_min = -x_range * std
+        x_max = x_range * std
 
     pdf_func = lambda x: beta_pdf_normalized(x, d)
 
@@ -163,7 +167,7 @@ if __name__ == "__main__":
     codebooks = build_all_codebooks(max_bits=8, d=d)
 
     # Save as numpy file
-    save_dict = {f"b{b}": v for b, v in codebooks.items()}
+    save_dict = {f"b{b}_d{d}": v for b, v in codebooks.items()}
     np.savez("codebooks.npz", **save_dict)
     print("\nSaved codebooks.npz")
 
