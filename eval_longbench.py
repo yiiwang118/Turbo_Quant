@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Standalone LongBench evaluation for TurboQuant KV quantization.
+"""LongBench evaluation for TurboQuant KV quantization.
 
-This script is fully local to Turboquant:
-- no AUTOKV_PATH
-- no import from sibling autokv repo
-- reusable logic lives under benchmark/
+Usage:
+    python eval_longbench.py --tasks qasper,triviaqa --bits 0,8,4,2,1 --fraction 0.1
+    python eval_longbench.py --config eval_config.yaml
+
+bits=0 is the unquantised baseline.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -14,127 +14,81 @@ import json
 from pathlib import Path
 from typing import Any
 
-import yaml
 from benchmark.longbench import (
-    DEFAULT_BITS,
-    DEFAULT_MODEL,
-    DEFAULT_TASKS,
-    LongBenchEvalConfig,
-    build_runner,
-    evaluate_longbench,
+    DEFAULT_BITS, DEFAULT_MODEL, DEFAULT_TASKS,
+    LongBenchEvalConfig, build_runner, evaluate_longbench,
 )
 
 
-def _parse_tasks(raw: Any) -> list[str]:
-    if isinstance(raw, list):
-        return [str(item).strip() for item in raw if str(item).strip()]
-    if isinstance(raw, str):
-        return [item.strip() for item in raw.split(",") if item.strip()]
-    raise ValueError(f"Unsupported tasks format: {type(raw)}")
+def _csv_str(raw: Any, default: list[str]) -> list[str]:
+    if isinstance(raw, list): return [str(x).strip() for x in raw]
+    if isinstance(raw, str):  return [x.strip() for x in raw.split(",") if x.strip()]
+    return default
+
+def _csv_int(raw: Any, default: list[int]) -> list[int]:
+    if isinstance(raw, list): return [int(x) for x in raw]
+    if isinstance(raw, str):  return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    return default
 
 
-def _parse_bits(raw: Any) -> list[int]:
-    if isinstance(raw, list):
-        return [int(item) for item in raw]
-    if isinstance(raw, str):
-        return [int(item.strip()) for item in raw.split(",") if item.strip()]
-    raise ValueError(f"Unsupported bits format: {type(raw)}")
-
-
-def _load_yaml_config(path: str | None) -> dict[str, Any]:
-    if not path:
-        return {}
-    config_path = Path(path)
-    with config_path.open("r", encoding="utf-8") as file:
-        raw = yaml.safe_load(file) or {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"YAML config must be a mapping, got: {type(raw)}")
-    return raw
-
-
-def _pick(cli_value: Any, yaml_data: dict[str, Any], key: str, default_value: Any) -> Any:
-    if cli_value is not None:
-        return cli_value
-    if key in yaml_data and yaml_data[key] is not None:
-        return yaml_data[key]
-    return default_value
-
-
-def _print_summary(results: dict[str, dict[str, float]], tasks: list[str], bit_list: list[int]) -> None:
-    labels = ["baseline"] + [f"b={bits}" for bits in bit_list if bits > 0]
-    col_w = max(len(label) for label in labels) + 2
-
-    header = f"{'task':<22}" + "".join(f"{label:>{col_w}}" for label in labels)
-    print("\n" + "=" * len(header))
-    print(header)
-    print("=" * len(header))
+def _print_table(results: dict[str, dict[str, float]], tasks: list[str], bits: list[int]) -> None:
+    labels = ["baseline"] + [f"b={b}" for b in bits if b > 0]
+    col    = max(len(l) for l in labels) + 2
+    header = f"{'task':<22}" + "".join(f"{l:>{col}}" for l in labels)
+    sep    = "=" * len(header)
+    print(f"\n{sep}\n{header}\n{sep}")
     for task in tasks:
-        row = f"{task:<22}"
-        for label in labels:
-            value = results[task].get(label, float("nan"))
-            row += f"{value:>{col_w}.2f}"
+        row = f"{task:<22}" + "".join(f"{results[task].get(l, float('nan')):>{col}.2f}" for l in labels)
         print(row)
-    print("=" * len(header))
+    print(sep)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LongBench evaluation for TurboQuant KV quantization")
-    parser.add_argument("--config", default=None, help="YAML config path (optional)")
-    parser.add_argument("--model", default=None, help="HuggingFace model ID")
-    parser.add_argument(
-        "--tasks",
-        default=None,
-        help="Comma-separated LongBench tasks",
-    )
-    parser.add_argument(
-        "--bits",
-        default=None,
-        help="Comma-separated bit-widths (0 = baseline without quantization)",
-    )
-    parser.add_argument("--fraction", type=float, default=None, help="Fraction of each task dataset to evaluate")
-    parser.add_argument("--max_new_tokens", type=int, default=None)
-    parser.add_argument("--max_context_length", type=int, default=None)
-    parser.add_argument("--output", default=None, help="JSON file to save results (optional)")
-    parser.add_argument("--seed", type=int, default=None)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model",              default=None)
+    parser.add_argument("--tasks",              default=None, help="comma-separated task names")
+    parser.add_argument("--bits",               default=None, help="comma-separated bit-widths; 0=baseline")
+    parser.add_argument("--fraction",           type=float, default=None)
+    parser.add_argument("--max_new_tokens",     type=int,   default=None)
+    parser.add_argument("--max_context_length", type=int,   default=None)
+    parser.add_argument("--seed",               type=int,   default=None)
+    parser.add_argument("--output",             default=None, help="path to save JSON results")
+
+    # Optional YAML config (CLI args take priority)
+    parser.add_argument("--config", default=None)
     args = parser.parse_args()
 
-    yaml_data = _load_yaml_config(args.config)
+    yaml_cfg: dict[str, Any] = {}
+    if args.config:
+        import yaml
+        yaml_cfg = yaml.safe_load(Path(args.config).read_text()) or {}
 
-    model = _pick(args.model, yaml_data, "model", DEFAULT_MODEL)
-    tasks = _parse_tasks(_pick(args.tasks, yaml_data, "tasks", DEFAULT_TASKS))
-    bits = _parse_bits(_pick(args.bits, yaml_data, "bits", DEFAULT_BITS))
-    fraction = float(_pick(args.fraction, yaml_data, "fraction", 0.1))
-    max_new_tokens = _pick(args.max_new_tokens, yaml_data, "max_new_tokens", None)
-    max_context_length = _pick(args.max_context_length, yaml_data, "max_context_length", None)
-    seed = int(_pick(args.seed, yaml_data, "seed", 42))
-    output_path = _pick(args.output, yaml_data, "output", None)
+    def pick(cli_val: Any, key: str, default: Any) -> Any:
+        return cli_val if cli_val is not None else yaml_cfg.get(key, default)
 
     config = LongBenchEvalConfig(
-        model=model,
-        tasks=tasks,
-        bits=bits,
-        fraction=fraction,
-        max_new_tokens=max_new_tokens,
-        max_context_length=max_context_length,
-        seed=seed,
+        model              = pick(args.model,              "model",              DEFAULT_MODEL),
+        tasks              = _csv_str(pick(args.tasks,     "tasks",              DEFAULT_TASKS), DEFAULT_TASKS),
+        bits               = _csv_int(pick(args.bits,      "bits",               DEFAULT_BITS),  DEFAULT_BITS),
+        fraction           = float(pick(args.fraction,     "fraction",           0.1)),
+        max_new_tokens     = pick(args.max_new_tokens,     "max_new_tokens",     None),
+        max_context_length = pick(args.max_context_length, "max_context_length", None),
+        seed               = int(pick(args.seed,           "seed",               42)),
     )
     config.validate()
 
-    print(f"Loading model: {config.model}")
+    print(f"Model: {config.model}")
     runner, device = build_runner(config.model)
-    print(f"Model loaded on {device}.\n")
+    print(f"Loaded on {device}.\n")
 
-    print("Running evaluation...\n")
     results = evaluate_longbench(runner=runner, config=config)
+    _print_table(results, config.tasks, config.bits)
 
-    _print_summary(results=results, tasks=config.tasks, bit_list=config.bits)
-
-    if output_path:
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        with output_file.open("w", encoding="utf-8") as file:
-            json.dump(results, file, indent=2, ensure_ascii=False)
-        print(f"\nResults saved to {output_file}")
+    if args.output:
+        out = Path(args.output)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+        print(f"\nSaved → {out}")
 
 
 if __name__ == "__main__":

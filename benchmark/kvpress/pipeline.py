@@ -1,5 +1,4 @@
-"""Local KV-press generation runner adapted from autokv/kvpress/pipeline.py."""
-
+# Adapted from autokv/kvpress/pipeline.py
 from __future__ import annotations
 
 import contextlib
@@ -12,15 +11,19 @@ from benchmark.kvpress.base_press import BasePress
 
 try:
     from tqdm import tqdm
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:
     tqdm = None
 
 
 class KVPressTextGenerationRunner:
-    """Run context prefill with optional press, then greedy decode answers."""
+    """Prefill context (optionally with a press), then greedy-decode answers.
+
+    Pattern:  context tokens → model.model() w/ press → DynamicCache
+              for each question: decode from cache, then trim cache back
+    """
 
     def __init__(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase):
-        self.model = model
+        self.model     = model
         self.tokenizer = tokenizer
 
     def __call__(
@@ -32,169 +35,125 @@ class KVPressTextGenerationRunner:
         press: Optional[BasePress] = None,
         max_new_tokens: int = 50,
         max_context_length: Optional[int] = None,
-        enable_thinking: bool = False,
         cache: Optional[Cache] = None,
     ) -> dict[str, str | list[str]]:
-        single_question = questions is None
-        assert question is None or questions is None, "Either question or questions should be provided, not both."
+        assert not (question and questions), "Provide question or questions, not both."
+        single = questions is None
         questions = questions or ([question] if question else [""])
 
-        if max_context_length is None:
-            max_context_length = min(self.tokenizer.model_max_length, int(1e10))
-        answer_prefix = answer_prefix or ""
+        max_ctx = max_context_length or min(self.tokenizer.model_max_length, int(1e10))
+        tensors = self._tokenize(context, questions, answer_prefix or "", max_ctx)
+        answers = self._run(tensors, press, max_new_tokens, cache)
 
-        input_tensors = self.preprocess(
-            context=context,
-            questions=questions,
-            answer_prefix=answer_prefix,
-            max_context_length=max_context_length,
-            enable_thinking=enable_thinking,
-        )
-        answers = self._forward(
-            input_tensors=input_tensors,
-            max_new_tokens=max_new_tokens,
-            press=press,
-            cache=cache,
-        )
+        return {"answer": answers[0]} if single else {"answers": answers}
 
-        if single_question:
-            return {"answer": answers[0]}
-        return {"answers": answers}
+    # ── Tokenisation ──────────────────────────────────────────────────────────
 
-    def preprocess(
+    def _tokenize(
         self,
         context: str,
         questions: list[str],
         answer_prefix: str,
         max_context_length: int,
-        enable_thinking: bool = False,
     ) -> dict[str, Any]:
         if self.tokenizer.chat_template is None:
-            bos_token = getattr(self.tokenizer, "bos_token", "")
-            context_with_prompt = bos_token + context
-            question_suffix = "\n"
+            ctx_text      = getattr(self.tokenizer, "bos_token", "") + context
+            question_sfx  = "\n"
         else:
-            separator = "#" * (len(context) + 10)
-            messages = [{"role": "user", "content": context + separator}]
+            sep = "#" * (len(context) + 10)
             try:
                 templated = self.tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    enable_thinking=enable_thinking,
+                    [{"role": "user", "content": context + sep}],
+                    add_generation_prompt=True, tokenize=False,
                 )
             except TypeError:
                 templated = self.tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=False,
+                    [{"role": "user", "content": context + sep}],
+                    add_generation_prompt=True, tokenize=False,
+                    enable_thinking=False,
                 )
-            if separator not in templated:
-                raise RuntimeError("Failed to split context and question prompt using separator.")
-            context_with_prompt, question_suffix = templated.split(separator, maxsplit=1)
+            if sep not in templated:
+                raise RuntimeError("Separator missing from chat template output.")
+            ctx_text, question_sfx = templated.split(sep, maxsplit=1)
 
-        full_questions = [f"{question}{question_suffix}{answer_prefix}" for question in questions]
+        ctx_ids = self.tokenizer.encode(ctx_text, return_tensors="pt", add_special_tokens=False)
+        if ctx_ids.shape[1] > max_context_length:
+            ctx_ids = ctx_ids[:, :max_context_length]
 
-        context_ids = self.tokenizer.encode(context_with_prompt, return_tensors="pt", add_special_tokens=False)
-        question_ids = [
-            self.tokenizer.encode(full_question, return_tensors="pt", add_special_tokens=False)
-            for full_question in full_questions
+        q_ids = [
+            self.tokenizer.encode(q + question_sfx + answer_prefix,
+                                  return_tensors="pt", add_special_tokens=False)
+            for q in questions
         ]
+        return {"context_ids": ctx_ids, "questions_ids": q_ids}
 
-        if context_ids.shape[1] > max_context_length:
-            context_ids = context_ids[:, :max_context_length]
+    # ── Inference ─────────────────────────────────────────────────────────────
 
-        return {"context_ids": context_ids, "questions_ids": question_ids}
-
-    def _forward(
+    def _run(
         self,
-        input_tensors: dict[str, Any],
-        max_new_tokens: int = 50,
-        press: Optional[BasePress] = None,
-        cache: Optional[Cache] = None,
+        tensors: dict[str, Any],
+        press: Optional[BasePress],
+        max_new_tokens: int,
+        cache: Optional[Cache],
     ) -> list[str]:
-        context_ids = input_tensors["context_ids"].to(self.model.device)
-        context_length = context_ids.shape[1]
-
+        ctx_ids = tensors["context_ids"].to(self.model.device)
+        ctx_len = ctx_ids.shape[1]
         if cache is None:
             cache = DynamicCache()
 
-        with press(self.model) if press is not None else contextlib.nullcontext():
-            backbone = self.model.model if hasattr(self.model, "model") else self.model
-            backbone(
-                input_ids=context_ids,
-                past_key_values=cache,
-            )
+        # Prefill: run backbone only (no lm head needed)
+        backbone = self.model.model if hasattr(self.model, "model") else self.model
+        ctx_mgr  = press(self.model) if press is not None else contextlib.nullcontext()
+        with ctx_mgr:
+            backbone(input_ids=ctx_ids, past_key_values=cache)
 
         answers: list[str] = []
-        question_ids_list = input_tensors["questions_ids"]
-        question_iterator = question_ids_list
-        if tqdm is not None and len(question_ids_list) > 1:
-            question_iterator = tqdm(
-                question_ids_list,
-                total=len(question_ids_list),
-                desc="Generating Answers",
-                leave=False,
-            )
+        q_list    = tensors["questions_ids"]
+        iterator  = tqdm(q_list, desc="Decoding", leave=False) if (tqdm and len(q_list) > 1) else q_list
 
-        for question_ids in question_iterator:
-            cache_seq_lengths = [cache.get_seq_length(layer_idx) for layer_idx in range(len(cache))]
-            answer = self.generate_answer(
-                question_ids=question_ids.to(self.model.device),
-                cache=cache,
-                context_length=context_length,
-                max_new_tokens=max_new_tokens,
-            )
-            self._remove_answer_from_cache(cache, cache_seq_lengths)
-            answers.append(answer)
+        for q_ids in iterator:
+            snap = [cache.get_seq_length(i) for i in range(len(cache))]
+            answers.append(self._decode(q_ids.to(self.model.device), cache, ctx_len, max_new_tokens))
+            self._trim_cache(cache, snap)   # rewind to pre-question state for next question
 
         return answers
 
-    def _remove_answer_from_cache(self, cache: Cache, cache_seq_lengths: list[int]) -> None:
-        for layer_idx, sequence_length in enumerate(cache_seq_lengths):
-            cache_layer = cache.layers[layer_idx]
-            if hasattr(cache_layer, "keys") and isinstance(cache_layer.keys, torch.Tensor):
-                cache_layer.keys = cache_layer.keys[:, :, :sequence_length]
-            if hasattr(cache_layer, "values") and isinstance(cache_layer.values, torch.Tensor):
-                cache_layer.values = cache_layer.values[:, :, :sequence_length]
-            if hasattr(cache_layer, "_quantized_keys") and isinstance(cache_layer._quantized_keys, torch.Tensor):
-                cache_layer._quantized_keys = cache_layer._quantized_keys[:, :, :sequence_length]
-            if hasattr(cache_layer, "_quantized_values") and isinstance(cache_layer._quantized_values, torch.Tensor):
-                cache_layer._quantized_values = cache_layer._quantized_values[:, :, :sequence_length]
+    def _decode(
+        self,
+        question_ids: torch.Tensor,
+        cache: Cache,
+        context_length: int,
+        max_new_tokens: int,
+    ) -> str:
+        pos = torch.arange(context_length, context_length + question_ids.shape[1],
+                           device=self.model.device).unsqueeze(0)
+        out = self.model(input_ids=question_ids, past_key_values=cache, position_ids=pos)
 
-    def generate_answer(self, question_ids: torch.Tensor, cache: Cache, context_length: int, max_new_tokens: int) -> str:
-        position_ids = torch.arange(
-            context_length,
-            context_length + question_ids.shape[1],
-            device=self.model.device,
-        ).unsqueeze(0)
+        eos = self.model.generation_config.eos_token_id or []
+        if not isinstance(eos, list):
+            eos = [eos]
 
-        outputs = self.model(
-            input_ids=question_ids,
-            past_key_values=cache,
-            position_ids=position_ids,
-        )
-
-        position_ids = position_ids[:, -1:] + 1
-        generated_ids = [outputs.logits[0, -1].argmax()]
-
-        eos_token_ids = self.model.generation_config.eos_token_id
-        if eos_token_ids is None:
-            eos_token_ids = []
-        if not isinstance(eos_token_ids, list):
-            eos_token_ids = [eos_token_ids]
-
+        pos    = pos[:, -1:] + 1
+        tokens = [out.logits[0, -1].argmax()]
         for step in range(max_new_tokens - 1):
-            outputs = self.model(
-                input_ids=generated_ids[-1].view(1, 1),
-                past_key_values=cache,
-                position_ids=position_ids + step,
-            )
-            new_id = outputs.logits[0, -1].argmax()
-            generated_ids.append(new_id)
-            if new_id.item() in eos_token_ids:
+            out  = self.model(input_ids=tokens[-1].view(1, 1), past_key_values=cache,
+                              position_ids=pos + step)
+            tok  = out.logits[0, -1].argmax()
+            tokens.append(tok)
+            if tok.item() in eos:
                 break
 
-        answer_ids = torch.stack(generated_ids).detach().cpu()
-        return str(self.tokenizer.decode(answer_ids, skip_special_tokens=True))
+        return self.tokenizer.decode(torch.stack(tokens).cpu(), skip_special_tokens=True)
 
+    def _trim_cache(self, cache: Cache, lengths: list[int]) -> None:
+        """Rewind cache to lengths captured before the last question was decoded."""
+        for i, seq_len in enumerate(lengths):
+            layer = cache.layers[i]
+            for attr in ("keys", "values"):
+                t = getattr(layer, attr, None)
+                if isinstance(t, torch.Tensor) and t.shape[2] > seq_len:
+                    setattr(layer, attr, t[:, :, :seq_len])
+            for attr in ("_quantized_keys", "_quantized_values"):
+                t = getattr(layer, attr, None)
+                if isinstance(t, torch.Tensor) and t.shape[2] > seq_len:
+                    setattr(layer, attr, t[:, :, :seq_len])
